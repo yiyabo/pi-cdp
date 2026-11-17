@@ -41,6 +41,7 @@ import type {
 	ScreenshotOptions,
 	ScreenshotResult,
 	SnapshotDiff,
+	SnapshotRefRegistry,
 	TabSummary,
 	TargetResolutionContext,
 	WaitConditionOptions,
@@ -230,6 +231,8 @@ interface TabState {
 	documentStatusByLoader: Map<string, number>;
 	latestSnapshot: AriaSnapshot | null;
 	previousSnapshot: AriaSnapshot | null;
+	/** Keeps `@eN` refs stable across snapshots until the next top-frame navigation. */
+	refRegistry: SnapshotRefRegistry;
 	waiters: Set<EventWaiter>;
 	closed: boolean;
 }
@@ -1145,6 +1148,7 @@ export class BrowserSessionManager {
 			documentStatusByLoader: new Map(),
 			latestSnapshot: null,
 			previousSnapshot: null,
+			refRegistry: { generation: 0, refsByElement: new Map(), lastIndex: 0 },
 			waiters: new Set(),
 			closed: false,
 		};
@@ -1322,7 +1326,10 @@ export class BrowserSessionManager {
 		tab: TabState,
 		options: AriaSnapshotOptions = {},
 	): Promise<AriaSnapshot> {
-		const snapshot = await this.deps.captureAriaSnapshot(session.client, tab.cdpSessionId, tab.generation, options);
+		const snapshot = await this.deps.captureAriaSnapshot(session.client, tab.cdpSessionId, tab.generation, {
+			...options,
+			refRegistry: tab.refRegistry,
+		});
 		tab.previousSnapshot = tab.latestSnapshot;
 		tab.latestSnapshot = snapshot;
 		if (snapshot.title) {

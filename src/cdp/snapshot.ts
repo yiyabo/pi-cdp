@@ -15,6 +15,7 @@ import type {
 	CdpSendOptions,
 	SnapshotDiff,
 	SnapshotRefEntry,
+	SnapshotRefRegistry,
 } from "../types.ts";
 
 interface AXValue {
@@ -207,6 +208,10 @@ interface RenderState {
 	/** Child frame trees keyed by the backendNodeId of their owning <iframe>. */
 	childFramesByOwner: Map<number, WalkFrame>;
 	renderedFrames: Set<string>;
+	/** Allocator for `@eN` refs (shared with earlier snapshots of the same generation when provided). */
+	registry: SnapshotRefRegistry;
+	/** Refs already emitted by this snapshot, guarding against handing one ref to two elements. */
+	usedRefs: Set<string>;
 }
 
 interface WalkContext {
@@ -290,6 +295,7 @@ function buildRefEntry(
 		...(value ? { value } : {}),
 		...(description ? { description } : {}),
 		...(checked ? { checked } : {}),
+		...(asBoolean(props.get("selected")) === true ? { selected: true } : {}),
 		...(asBoolean(props.get("disabled")) === true ? { disabled: true } : {}),
 		...(expanded === undefined ? {} : { expanded }),
 		...(asBoolean(props.get("required")) === true ? { required: true } : {}),
@@ -299,7 +305,10 @@ function buildRefEntry(
 	};
 }
 
-/** Assigns the next `@eN` ref and emits its line; returns false when the budget is exhausted. */
+/**
+ * Emits an interactive line with its `@eN` ref; returns false when the budget is exhausted. Elements already known
+ * to the registry keep their ref; others get the next unused number, committed only once the line is emitted.
+ */
 function renderInteractive(
 	state: RenderState,
 	depth: number,
@@ -311,7 +320,10 @@ function renderInteractive(
 		state.stopped = true;
 		return false;
 	}
-	const ref = `@e${state.refs.length + 1}`;
+	const key = identityKey(entry);
+	const known = state.registry.refsByElement.get(key);
+	const reuse = known !== undefined && !state.usedRefs.has(known);
+	const ref = reuse ? known : `@e${state.registry.lastIndex + 1}`;
 	const role = entry.role;
 	const displayRole = INTERACTIVE_ROLES.has(role) ? role : `${role} (editable)`;
 	const value = entry.value ?? "";
@@ -321,6 +333,11 @@ function renderInteractive(
 	if (!emit(state, depth, line)) {
 		return false;
 	}
+	if (!reuse) {
+		state.registry.lastIndex += 1;
+		state.registry.refsByElement.set(key, ref);
+	}
+	state.usedRefs.add(ref);
 	state.refs.push({ ref, ...entry });
 	return true;
 }
@@ -592,7 +609,11 @@ async function resolveStartIds(
 	throw new Error(`rootSelector ${JSON.stringify(rootSelector)} has no accessibility node`);
 }
 
-function createRenderState(options: AriaSnapshotOptions | undefined, childFramesByOwner: Map<number, WalkFrame>): RenderState {
+function createRenderState(
+	options: AriaSnapshotOptions | undefined,
+	childFramesByOwner: Map<number, WalkFrame>,
+	registry: SnapshotRefRegistry,
+): RenderState {
 	return {
 		lines: [],
 		chars: 0,
@@ -607,6 +628,8 @@ function createRenderState(options: AriaSnapshotOptions | undefined, childFrames
 		visited: new Set<string>(),
 		childFramesByOwner,
 		renderedFrames: new Set<string>(),
+		registry,
+		usedRefs: new Set<string>(),
 	};
 }
 
@@ -653,7 +676,7 @@ export async function captureAriaSnapshot(
 			: await fetchChildFrameTrees(client, send, collectBackendIds(mainNodes));
 	const startIds = await resolveStartIds(client, send, mainFrame, options?.rootSelector);
 
-	const state = createRenderState(options, childFramesByOwner);
+	const state = createRenderState(options, childFramesByOwner, prepareRefRegistry(options?.refRegistry, generation));
 	const rootCtx: WalkContext = { depth: 0, contentName: "", insideEditable: false };
 	for (const rootId of startIds) {
 		walkNode(state, mainFrame, rootId, rootCtx);
@@ -678,11 +701,24 @@ export async function captureAriaSnapshot(
 	};
 }
 
-function identityKey(entry: SnapshotRefEntry): string {
+/** A shared registry is reset when the document generation moved on; without one each snapshot numbers from @e1. */
+function prepareRefRegistry(registry: SnapshotRefRegistry | undefined, generation: number): SnapshotRefRegistry {
+	if (!registry) {
+		return { generation, refsByElement: new Map(), lastIndex: 0 };
+	}
+	if (registry.generation !== generation) {
+		registry.generation = generation;
+		registry.refsByElement.clear();
+		registry.lastIndex = 0;
+	}
+	return registry;
+}
+
+function identityKey(entry: Pick<SnapshotRefEntry, "frameId" | "backendNodeId">): string {
 	return `${entry.frameId ?? "main"}:${entry.backendNodeId}`;
 }
 
-const COMPARED_FIELDS = ["role", "name", "value", "checked", "disabled", "expanded", "required", "focused"] as const;
+const COMPARED_FIELDS = ["role", "name", "value", "checked", "selected", "disabled", "expanded", "required", "focused"] as const;
 
 function describeRef(entry: SnapshotRefEntry): string {
 	return `${entry.ref} ${entry.role}${entry.name ? ` ${JSON.stringify(clip(entry.name, 60))}` : ""}`;

@@ -110,6 +110,8 @@ export interface SnapshotRefEntry {
 	value?: string;
 	description?: string;
 	checked?: "true" | "false" | "mixed";
+	/** True for a selected option/tab/row (e.g. picks in a `<select multiple>`). */
+	selected?: boolean;
 	disabled?: boolean;
 	expanded?: boolean;
 	required?: boolean;
@@ -126,6 +128,20 @@ export interface AriaSnapshotOptions {
 	rootSelector?: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
+	/**
+	 * Keeps `@eN` refs stable across repeated snapshots of one document generation: elements seen before keep
+	 * their ref and new elements get never-before-used numbers. Mutated in place; reset when the generation changes.
+	 */
+	refRegistry?: SnapshotRefRegistry;
+}
+
+/** Per-tab `@eN` allocator shared by successive snapshots of the same document generation. */
+export interface SnapshotRefRegistry {
+	generation: number;
+	/** `${frameId ?? "main"}:${backendNodeId}` → `@eN`. */
+	refsByElement: Map<string, string>;
+	/** Highest N handed out in this generation; numbers are never reassigned to a different element. */
+	lastIndex: number;
 }
 
 export interface AriaSnapshot {

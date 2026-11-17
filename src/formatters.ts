@@ -49,6 +49,9 @@ export function formatRefEntry(ref: SnapshotRefEntry): string {
 	if (ref.checked !== undefined) {
 		flags.push(`checked=${String(ref.checked)}`);
 	}
+	if (ref.selected) {
+		flags.push("selected");
+	}
 	if (ref.disabled) {
 		flags.push("disabled");
 	}
@@ -176,6 +179,10 @@ export function formatSnapshot(snapshot: AriaSnapshot): string {
 	return `${header.join("\n")}\n\n${body}`;
 }
 
+/**
+ * Structured diff listing. `limit` caps the itemised added/changed lines; `limit = 0` reports counts only
+ * (used when the full new snapshot follows anyway). `summaryText` is only a fallback so nothing is repeated.
+ */
 export function formatSnapshotDiff(diff: SnapshotDiff, limit = DEFAULT_LIST_LIMIT): string {
 	const lines: string[] = ["Changes since previous snapshot:"];
 	if (diff.urlChanged) {
@@ -184,29 +191,35 @@ export function formatSnapshotDiff(diff: SnapshotDiff, limit = DEFAULT_LIST_LIMI
 	if (diff.titleChanged) {
 		lines.push("  Title changed");
 	}
-	const shownAdded = diff.addedRefs.slice(0, limit);
 	if (diff.addedRefs.length > 0) {
-		lines.push(`  Added (${diff.addedRefs.length}):`);
-		for (const ref of shownAdded) {
-			lines.push(`    + ${formatRefEntry(ref)}`);
+		if (limit > 0) {
+			const shownAdded = diff.addedRefs.slice(0, limit);
+			lines.push(`  Added (${diff.addedRefs.length}):`);
+			for (const ref of shownAdded) {
+				lines.push(`    + ${formatRefEntry(ref)}`);
+			}
+			lines.push(...moreLine(diff.addedRefs.length, shownAdded.length).map((line) => `  ${line}`));
+		} else {
+			lines.push(`  Added: ${diff.addedRefs.length}`);
 		}
-		lines.push(...moreLine(diff.addedRefs.length, shownAdded.length).map((line) => `  ${line}`));
 	}
-	const shownChanged = diff.changedRefs.slice(0, limit);
 	if (diff.changedRefs.length > 0) {
-		lines.push(`  Changed (${diff.changedRefs.length}):`);
-		for (const change of shownChanged) {
-			lines.push(`    ~ ${formatRefEntry(change.before)}  ⇒  ${formatRefEntry(change.after)}`);
+		if (limit > 0) {
+			const shownChanged = diff.changedRefs.slice(0, limit);
+			lines.push(`  Changed (${diff.changedRefs.length}):`);
+			for (const change of shownChanged) {
+				lines.push(`    ~ ${formatRefEntry(change.before)}  ⇒  ${formatRefEntry(change.after)}`);
+			}
+			lines.push(...moreLine(diff.changedRefs.length, shownChanged.length).map((line) => `  ${line}`));
+		} else {
+			lines.push(`  Changed: ${diff.changedRefs.length}`);
 		}
-		lines.push(...moreLine(diff.changedRefs.length, shownChanged.length).map((line) => `  ${line}`));
 	}
 	if (diff.removedCount > 0) {
 		lines.push(`  Removed: ${diff.removedCount}`);
 	}
 	if (lines.length === 1) {
-		lines.push(diff.summaryText ? `  ${diff.summaryText}` : "  (no changes)");
-	} else if (diff.summaryText) {
-		lines.splice(1, 0, `  ${diff.summaryText}`);
+		lines.push(diff.summaryText ? `  ${diff.summaryText.split("\n").join("\n  ")}` : "  (no changes)");
 	}
 	return lines.join("\n");
 }

@@ -138,6 +138,18 @@ export function normalizeRef(target: string): string | null {
 	return match ? `@e${match[1]}` : null;
 }
 
+/** `@eLow..@eHigh` span of a snapshot's refs (refs stay stable within a generation, so numbering may have gaps). */
+function refRangeText(refs: readonly SnapshotRefEntry[]): string {
+	const numbers = refs.map((entry) => Number.parseInt(entry.ref.replace(/^@e/, ""), 10)).filter(Number.isFinite);
+	if (numbers.length === 0) {
+		return `${refs.length} refs`;
+	}
+	const low = Math.min(...numbers);
+	const high = Math.max(...numbers);
+	const span = `@e${low}..@e${high}`;
+	return refs.length === high - low + 1 ? span : `${refs.length} refs within ${span}`;
+}
+
 function describeEntry(entry: SnapshotRefEntry): string {
 	return `${entry.ref} ${entry.role}${entry.name ? ` ${JSON.stringify(entry.name)}` : ""}`;
 }
@@ -221,7 +233,7 @@ async function resolveRefTarget(ctx: TargetResolutionContext, ref: string): Prom
 	}
 	const entry = snapshot.refMap.get(ref);
 	if (!entry) {
-		const last = snapshot.refs.length > 0 ? ` (latest snapshot has @e1..@e${snapshot.refs.length})` : "";
+		const last = snapshot.refs.length > 0 ? ` (latest snapshot has ${refRangeText(snapshot.refs)})` : "";
 		throw new Error(`Unknown ref ${ref}${last} — run snapshot again to get current refs.`);
 	}
 	if (snapshot.generation !== ctx.currentGeneration) {

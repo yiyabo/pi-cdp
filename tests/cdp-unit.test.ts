@@ -298,6 +298,57 @@ describe("captureAriaSnapshot", () => {
 		assert.equal(snap.treeText, ["- navigation", '  - link "Docs" @e1', '  - link "No DOM"'].join("\n"));
 		assert.ok(client.callsOf("Runtime.releaseObject").some((call) => call.params.objectId === "root-obj"));
 	});
+
+	test("a shared refRegistry keeps refs stable within a generation and restarts numbering on a new one", async () => {
+		const registry = { generation: 0, refsByElement: new Map<string, string>(), lastIndex: 0 };
+		const first = await captureAriaSnapshot(new MockCdpClient(snapshotHandler(sampleTree())), "S1", 3, { refRegistry: registry });
+		assert.deepEqual(
+			first.refs.map((r) => r.ref),
+			["@e1", "@e2", "@e3", "@e4", "@e5"],
+		);
+
+		// "Delete" (backend 11) disappears and a new "Reset" button (backend 99) appears before "Agree".
+		const mutated = sampleTree()
+			.filter((node) => node.nodeId !== "7")
+			.map((node) => (node.nodeId === "3" ? { ...node, childIds: ["4", "70"] } : node));
+		mutated.push(ax("70", "button", { name: "Reset", parentId: "3", backendDOMNodeId: 99 }));
+		const second = await captureAriaSnapshot(new MockCdpClient(snapshotHandler(mutated)), "S1", 3, { refRegistry: registry });
+		assert.deepEqual(
+			second.refs.map((r) => `${r.ref}:${r.name}`),
+			["@e1:Save", "@e6:Reset", "@e3:Agree", "@e4:", "@e5:Docs"],
+		);
+		assert.equal(second.refMap.has("@e2"), false, "a removed element's ref is never handed to another element");
+		assert.match(second.treeText, /- button "Reset" @e6/);
+
+		const nextGeneration = await captureAriaSnapshot(new MockCdpClient(snapshotHandler(mutated)), "S1", 4, { refRegistry: registry });
+		assert.deepEqual(
+			nextGeneration.refs.map((r) => r.ref),
+			["@e1", "@e2", "@e3", "@e4", "@e5"],
+		);
+		assert.equal(registry.generation, 4);
+	});
+
+	test("records selected options so selection changes show up in diffs", async () => {
+		const nodes = [
+			ax("1", "RootWebArea", { childIds: ["2"], backendDOMNodeId: 1 }),
+			ax("2", "listbox", { name: "Toppings", parentId: "1", childIds: ["3", "4"], backendDOMNodeId: 2 }),
+			ax("3", "option", { name: "Cheese", parentId: "2", backendDOMNodeId: 3, properties: { selected: true } }),
+			ax("4", "option", { name: "Olives", parentId: "2", backendDOMNodeId: 4, properties: { selected: false } }),
+		];
+		const before = await captureAriaSnapshot(new MockCdpClient(snapshotHandler(nodes)), "S1", 1);
+		assert.equal(before.refMap.get("@e2")?.selected, true);
+		assert.equal(before.refMap.get("@e3")?.selected, undefined);
+		const toggled = nodes.map((node) =>
+			node.nodeId === "4" ? ax("4", "option", { name: "Olives", parentId: "2", backendDOMNodeId: 4, properties: { selected: true } }) : node,
+		);
+		const after = await captureAriaSnapshot(new MockCdpClient(snapshotHandler(toggled)), "S1", 1);
+		const diff = diffAriaSnapshots(before, after);
+		assert.deepEqual(
+			diff.changedRefs.map((change) => `${change.after.name}:${String(change.after.selected)}`),
+			["Olives:true"],
+		);
+		assert.match(diff.summaryText, /~ @e3 option "Olives" \(selected: null → true\)/);
+	});
 });
 
 function makeSnapshot(refs: SnapshotRefEntry[], overrides: Partial<AriaSnapshot> = {}): AriaSnapshot {
