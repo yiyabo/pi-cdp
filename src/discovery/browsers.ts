@@ -852,7 +852,11 @@ export async function selectLiveEndpointForAttach(
 	const includeApprovalMode = opts.includeApprovalMode === true;
 
 	if (opts.wsUrl) {
-		return endpointFromWsUrl(opts.wsUrl);
+		const endpoint = await endpointFromWsUrl(opts.wsUrl);
+		if (endpoint.mode === "approval" && !includeApprovalMode) {
+			throw approvalRefusal(endpoint);
+		}
+		return endpoint;
 	}
 
 	if (opts.port !== undefined || opts.host !== undefined) {

@@ -28,7 +28,11 @@ const DEFAULT_LAUNCH_TIMEOUT_MS = 30_000;
 const CLOSE_WAIT_MS = 1_000;
 const STDERR_TAIL_LIMIT = 64 * 1024;
 const EARLY_EXIT_WINDOW_MS = 3_000;
-const DEVTOOLS_LISTENING_RE = /^DevTools listening on (ws:\/\/\S+)$/m;
+/**
+ * Requires the trailing newline so a stderr chunk split mid-URL never yields a truncated ws:// URL.
+ * Exported for unit tests.
+ */
+export const DEVTOOLS_LISTENING_RE = /^DevTools listening on (ws:\/\/\S+)\r?\n/m;
 const SANDBOX_FAILURE_RE = /sandbox|namespace|SUID/i;
 
 /** Error returned by the browser for a failed CDP command (`{ id, error: { code, message } }`). */

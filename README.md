@@ -2,7 +2,7 @@
 
 Zero-dependency native **Chrome DevTools Protocol (CDP)** browser automation, `@eN` accessibility snapshots, visual screenshots, and live Chrome attach for [Pi](https://pi.dev).
 
-Built directly on Node.js `>=22.6` built-in `WebSocket` — **0 runtime npm dependencies**, **no background daemon**, **no MCP bridge**, **no manual browser downloads**, and a **fixed session tool list** that never invalidates your LLM prompt cache.
+Built directly on Node.js `>=22.18` built-in `WebSocket` — **0 runtime npm dependencies**, **no background daemon**, **no MCP bridge**, **no manual browser downloads**, and a **fixed session tool list** that never invalidates your LLM prompt cache.
 
 ## Why `pi-cdp`?
 

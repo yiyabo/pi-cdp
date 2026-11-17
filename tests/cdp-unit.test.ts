@@ -16,7 +16,7 @@ import {
 	typeText,
 	waitForCondition,
 } from "../src/cdp/actions.ts";
-import { CdpMultiplexClient, CdpProtocolError, fetchJsonVersion } from "../src/cdp/client.ts";
+import { CdpMultiplexClient, CdpProtocolError, DEVTOOLS_LISTENING_RE, fetchJsonVersion } from "../src/cdp/client.ts";
 import { type AXNode, captureAriaSnapshot, diffAriaSnapshots } from "../src/cdp/snapshot.ts";
 import type {
 	AriaSnapshot,
@@ -296,7 +296,9 @@ describe("captureAriaSnapshot", () => {
 		);
 		const snap = await captureAriaSnapshot(client, "S1", 1, { rootSelector: "nav" });
 		assert.equal(snap.treeText, ["- navigation", '  - link "Docs" @e1', '  - link "No DOM"'].join("\n"));
-		assert.ok(client.callsOf("Runtime.releaseObject").some((call) => call.params.objectId === "root-obj"));
+		const release = client.callsOf("Runtime.releaseObject").find((call) => call.params.objectId === "root-obj");
+		assert.ok(release);
+		assert.deepEqual(release.options, { sessionId: "S1", timeoutMs: 2_000 }, "release must not carry the caller's AbortSignal");
 	});
 
 	test("a shared refRegistry keeps refs stable within a generation and restarts numbering on a new one", async () => {
@@ -569,6 +571,29 @@ describe("clickTarget", () => {
 		assert.ok(
 			client.callsOf("Runtime.callFunctionOn").some((call) => String(call.params.functionDeclaration).includes("this.click()")),
 		);
+		const fallback = client
+			.callsOf("Runtime.callFunctionOn")
+			.find((call) => String(call.params.functionDeclaration).includes("this.click()"));
+		assert.match(String(fallback?.params.functionDeclaration), /if \(!this\.isConnected\) \{ throw new Error\("element is stale or detached/);
+	});
+
+	test("JS click fallback refuses a node that detached after resolution", async () => {
+		const client = new MockCdpClient(
+			domHandler({ quads: [] }, (method, params) => {
+				if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("this.click()")) {
+					return {
+						result: { type: "object", subtype: "error" },
+						exceptionDetails: {
+							text: "Uncaught",
+							exception: { type: "object", description: "Error: element is stale or detached from the document — run snapshot again" },
+						},
+					};
+				}
+				return undefined;
+			}),
+		);
+		await assert.rejects(clickTarget(actionContext(client), "@e1"), /JS click fallback failed: Error: element is stale or detached/);
+		assert.equal(client.callsOf("Input.dispatchMouseEvent").length, 0);
 	});
 });
 
@@ -589,6 +614,21 @@ describe("fillTarget / selectTarget", () => {
 		assert.match(fn, /new win\.Event\("change", \{ bubbles: true \}\)/);
 		assert.deepEqual(fillCall.params.arguments, [{ value: "a@b.co" }]);
 		assert.ok(client.callsOf("Runtime.releaseObject").some((call) => call.params.objectId === "obj-10"));
+	});
+
+	test("releaseObject never forwards the caller's AbortSignal so aborted actions still free remote objects", async () => {
+		const client = new MockCdpClient(domHandler({ callResult: "x" }));
+		const controller = new AbortController();
+		await fillTarget({ ...actionContext(client), signal: controller.signal, timeoutMs: 9_000 }, "@e1", "x");
+		const fillCall = client
+			.callsOf("Runtime.callFunctionOn")
+			.find((call) => String(call.params.functionDeclaration).includes("getOwnPropertyDescriptor"));
+		assert.equal(fillCall?.options?.signal, controller.signal, "the action itself honours the signal");
+		const releases = client.callsOf("Runtime.releaseObject");
+		assert.ok(releases.length >= 2);
+		for (const release of releases) {
+			assert.deepEqual(release.options, { sessionId: "S1", timeoutMs: 2_000 });
+		}
 	});
 
 	test("fill surfaces page exceptionDetails and still releases the object", async () => {
@@ -663,6 +703,35 @@ describe("keyboard and evaluation", () => {
 			return {};
 		});
 		assert.deepEqual(await evaluateExpression(objects, "S1", "({a:1})"), { valueText: '{\n  "a": 1\n}', isError: false });
+	});
+
+	test("evaluateExpression uses a unique objectGroup per call and releases it without the caller's signal", async () => {
+		const client = new MockCdpClient((method) =>
+			method === "Runtime.evaluate" ? { result: { type: "number", value: 1, description: "1" } } : {},
+		);
+		const controller = new AbortController();
+		await Promise.all([
+			evaluateExpression(client, "S1", "1", 5_000, controller.signal),
+			evaluateExpression(client, "S1", "1", 5_000, controller.signal),
+		]);
+		const groups = client.callsOf("Runtime.evaluate").map((call) => String(call.params.objectGroup));
+		assert.equal(groups.length, 2);
+		assert.notEqual(groups[0], groups[1], "concurrent evaluations must not share an object group");
+		for (const group of groups) {
+			assert.match(group, /^pi-cdp-eval-\d+$/);
+		}
+		for (const call of client.callsOf("Runtime.evaluate")) {
+			assert.equal(call.options?.signal, controller.signal);
+		}
+		const releases = client.callsOf("Runtime.releaseObjectGroup");
+		assert.deepEqual(
+			releases.map((call) => String(call.params.objectGroup)).sort(),
+			[...groups].sort(),
+			"each call releases exactly its own group",
+		);
+		for (const release of releases) {
+			assert.deepEqual(release.options, { sessionId: "S1", timeoutMs: 2_000 });
+		}
 	});
 });
 
@@ -1048,6 +1117,16 @@ describe("CdpMultiplexClient", () => {
 		const url = server.url;
 		await server.close();
 		await assert.rejects(CdpMultiplexClient.connect(url, 2_000), /Failed to connect|closed during handshake/);
+	});
+});
+
+describe("DEVTOOLS_LISTENING_RE", () => {
+	test("only matches a complete stderr line so a chunk split mid-URL never yields a truncated ws:// URL", () => {
+		const full = "ws://127.0.0.1:41234/devtools/browser/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab";
+		assert.equal(DEVTOOLS_LISTENING_RE.exec(`DevTools listening on ${full.slice(0, 30)}`), null);
+		assert.equal(DEVTOOLS_LISTENING_RE.exec(`noise\nDevTools listening on ${full}`), null);
+		assert.equal(DEVTOOLS_LISTENING_RE.exec(`noise\nDevTools listening on ${full}\n`)?.[1], full);
+		assert.equal(DEVTOOLS_LISTENING_RE.exec(`DevTools listening on ${full}\r\nmore`)?.[1], full);
 	});
 });
 

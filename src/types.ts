@@ -1,6 +1,6 @@
 /**
  * Core contracts and CDP types for pi-cdp.
- * Zero external runtime dependencies; compatible with Node.js >=22.6 built-in WebSocket.
+ * Zero external runtime dependencies; compatible with Node.js >=22.18 built-in WebSocket.
  */
 
 export type BrowserChannel =
@@ -260,10 +260,15 @@ export interface DialogEntry {
 	type: string;
 	message: string;
 	defaultPrompt?: string;
-	handled: "accepted" | "dismissed";
+	/** `pending` = recorded under the `manual` policy and left open for the user to answer. */
+	handled: "accepted" | "dismissed" | "pending";
 }
 
-export type DialogPolicy = "accept" | "dismiss";
+/**
+ * How JavaScript dialogs are answered. `manual` never calls `Page.handleJavaScriptDialog` (not even for
+ * beforeunload) and only records the dialog — the default for attached sessions so user tabs are untouched.
+ */
+export type DialogPolicy = "accept" | "dismiss" | "manual";
 
 export interface TabSummary {
 	tabId: string;

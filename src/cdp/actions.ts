@@ -42,7 +42,10 @@ const REF_PATTERN = /^@?e(\d+)$/;
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000;
 const WAIT_POLL_MS = 100;
 const MAX_EVAL_TEXT = 50_000;
-const EVAL_OBJECT_GROUP = "pi-cdp-eval";
+const EVAL_OBJECT_GROUP_PREFIX = "pi-cdp-eval";
+/** Cleanup commands must outlive the caller's AbortSignal so remote objects are released even after an abort. */
+const RELEASE_TIMEOUT_MS = 2_000;
+let evalCounter = 0;
 
 function ctxOptions(ctx: TargetResolutionContext): CdpSendOptions {
 	return {
@@ -160,7 +163,8 @@ function staleRefError(ref: string): Error {
 
 async function releaseObject(client: CdpClientInterface, options: CdpSendOptions, objectId: string): Promise<void> {
 	try {
-		await client.send("Runtime.releaseObject", { objectId }, options);
+		// Deliberately drop the caller's AbortSignal: an aborted action must still free its remote object.
+		await client.send("Runtime.releaseObject", { objectId }, { sessionId: options.sessionId, timeoutMs: RELEASE_TIMEOUT_MS });
 	} catch {
 		// Object already collected (navigation, context destroyed).
 	}
@@ -357,7 +361,12 @@ export async function clickTarget(
 
 	const center = await elementCenter(actionCtx, resolved.backendNodeId);
 	if (!center) {
-		await callOnNode(actionCtx, resolved.backendNodeId, "JS click fallback", "function() { this.click(); }");
+		await callOnNode(
+			actionCtx,
+			resolved.backendNodeId,
+			"JS click fallback",
+			'function() { if (!this.isConnected) { throw new Error("element is stale or detached from the document — run snapshot again"); } this.click(); }',
+		);
 		return { clicked: `${resolved.description} (JS click fallback: element has no visible box)`, x: 0, y: 0 };
 	}
 
@@ -968,12 +977,14 @@ export async function evaluateExpression(
 	signal?: AbortSignal,
 ): Promise<{ valueText: string; isError: boolean }> {
 	const options = sendOptions(sessionId, timeoutMs, signal);
+	// A unique group per call so concurrent evaluations never release each other's objects.
+	const objectGroup = `${EVAL_OBJECT_GROUP_PREFIX}-${++evalCounter}`;
 	try {
 		const response = await client.send<EvaluateResponse>(
 			"Runtime.evaluate",
 			{
 				expression,
-				objectGroup: EVAL_OBJECT_GROUP,
+				objectGroup,
 				returnByValue: false,
 				awaitPromise: true,
 				userGesture: true,
@@ -1008,7 +1019,7 @@ export async function evaluateExpression(
 		const text = typeof json === "string" ? json : (result.description ?? result.className ?? "object");
 		return { valueText: clipText(text), isError: false };
 	} finally {
-		await sendQuietly(client, "Runtime.releaseObjectGroup", { objectGroup: EVAL_OBJECT_GROUP }, options);
+		await sendQuietly(client, "Runtime.releaseObjectGroup", { objectGroup }, { sessionId, timeoutMs: RELEASE_TIMEOUT_MS });
 	}
 }
 

@@ -513,7 +513,7 @@ describe("live endpoint discovery & attach selection", () => {
 		}
 	});
 
-	test("selectLiveEndpointForAttach honours explicit port and wsUrl", async () => {
+	test("selectLiveEndpointForAttach honours explicit port and wsUrl (approval mode still gated)", async () => {
 		let serverPort = 0;
 		const normal = await startServer(jsonVersionHandler(() => serverPort));
 		serverPort = normal.port;
@@ -524,7 +524,12 @@ describe("live endpoint discovery & attach selection", () => {
 			assert.equal(byPort.wsUrl, `ws://127.0.0.1:${normal.port}/devtools/browser/normal-id`);
 
 			const approvalWs = `ws://127.0.0.1:${approval.port}/devtools/browser/approval-id`;
-			const byWs = await selectLiveEndpointForAttach({ wsUrl: approvalWs });
+			await assert.rejects(
+				selectLiveEndpointForAttach({ wsUrl: approvalWs }),
+				/is in approval mode; connecting will prompt "Allow remote debugging\?"/,
+				"an explicit wsUrl must not bypass includeApprovalMode",
+			);
+			const byWs = await selectLiveEndpointForAttach({ wsUrl: approvalWs, includeApprovalMode: true });
 			assert.equal(byWs.mode, "approval");
 			assert.equal(byWs.wsUrl, approvalWs);
 

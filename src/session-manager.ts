@@ -73,6 +73,8 @@ export interface LaunchSessionOptions {
 	url?: string;
 	cwd?: string;
 	extraArgs?: string[];
+	/** JavaScript dialog policy for this session (default `dismiss` for launched browsers). */
+	dialogPolicy?: DialogPolicy;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 }
@@ -82,6 +84,8 @@ export interface AttachSessionOptions {
 	host?: string;
 	port?: number;
 	name?: string;
+	/** JavaScript dialog policy for this session (default `manual`: never answer dialogs in the user's tabs). */
+	dialogPolicy?: DialogPolicy;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 }
@@ -249,7 +253,8 @@ interface SessionState {
 	handle?: LaunchedBrowserHandle;
 	tabs: Map<string, TabState>;
 	tabsByCdpSession: Map<string, TabState>;
-	pendingAttachTargets: Set<string>;
+	/** In-flight `attachTab` calls keyed by targetId, so concurrent attaches to one target share a single tab. */
+	pendingAttaches: Map<string, Promise<TabState>>;
 	activeTabId: string | null;
 	dialogPolicy: DialogPolicy;
 	nextTabNumber: number;
@@ -305,6 +310,10 @@ function toTargetInfo(value: unknown): TargetInfoLike | undefined {
 
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
+}
+
+function shutdownDuringStartupError(phase: string): Error {
+	return new Error(`Browser sessions were shut down while ${phase}; the new connection was closed instead of being registered.`);
 }
 
 function truncateText(text: string, max: number): string {
@@ -411,6 +420,8 @@ export class BrowserSessionManager {
 	private readonly listeners = new Set<() => void>();
 	private activeSessionId: string | null = null;
 	private nextSessionNumber = 1;
+	/** Bumped by `disposeAll()`; launch/attach compare it across awaits so a shutdown never leaks a new browser. */
+	private disposeEpoch = 0;
 
 	constructor(deps: Partial<BrowserSessionManagerDeps> = {}) {
 		this.deps = { ...DEFAULT_DEPS, ...deps };
@@ -465,6 +476,7 @@ export class BrowserSessionManager {
 	async launch(opts: LaunchSessionOptions = {}): Promise<LaunchSessionResult> {
 		const timeoutMs = opts.timeoutMs ?? DEFAULT_ATTACH_TIMEOUT_MS;
 		const headless = opts.headless ?? true;
+		const epoch = this.disposeEpoch;
 		const handle = await this.deps.launchBrowserProcess({
 			executablePath: opts.executablePath,
 			cwd: opts.cwd,
@@ -475,6 +487,10 @@ export class BrowserSessionManager {
 			timeoutMs,
 			signal: opts.signal,
 		});
+		if (this.disposeEpoch !== epoch) {
+			await handle.shutdown().catch(() => undefined);
+			throw shutdownDuringStartupError(`launching ${handle.browserName}`);
+		}
 		const id = `b${this.nextSessionNumber++}`;
 		const session = this.createSessionState({
 			id,
@@ -487,14 +503,23 @@ export class BrowserSessionManager {
 			client: handle.client,
 			handle,
 			viewport: opts.viewport,
+			dialogPolicy: opts.dialogPolicy ?? "dismiss",
 		});
 		try {
 			await this.attachInitialTabs(session, timeoutMs, opts.signal);
 		} catch (err) {
 			session.disposed = true;
 			session.unsubscribe();
+			this.releaseAllWaiters(session);
 			await handle.shutdown().catch(() => undefined);
 			throw new Error(`Launched ${handle.browserName} but failed to attach a page target: ${errorMessage(err)}`);
+		}
+		if (this.disposeEpoch !== epoch) {
+			session.disposed = true;
+			session.unsubscribe();
+			this.releaseAllWaiters(session);
+			await handle.shutdown().catch(() => undefined);
+			throw shutdownDuringStartupError(`launching ${handle.browserName}`);
 		}
 		this.sessions.set(id, session);
 		this.activeSessionId = id;
@@ -509,6 +534,7 @@ export class BrowserSessionManager {
 
 	async attach(opts: AttachSessionOptions = {}): Promise<BrowserSessionSummary> {
 		const timeoutMs = opts.timeoutMs ?? DEFAULT_ATTACH_TIMEOUT_MS;
+		const epoch = this.disposeEpoch;
 		const endpoint = await this.deps.selectLiveEndpointForAttach({
 			host: opts.host,
 			port: opts.port,
@@ -516,6 +542,10 @@ export class BrowserSessionManager {
 			includeApprovalMode: true,
 		});
 		const client = await this.deps.connectClient(endpoint.wsUrl, timeoutMs, opts.signal);
+		if (this.disposeEpoch !== epoch) {
+			await client.close().catch(() => undefined);
+			throw shutdownDuringStartupError(`connecting to ${endpoint.browserName}`);
+		}
 		const id = `b${this.nextSessionNumber++}`;
 		const session = this.createSessionState({
 			id,
@@ -525,14 +555,23 @@ export class BrowserSessionManager {
 			wsUrl: endpoint.wsUrl,
 			headless: false,
 			client,
+			dialogPolicy: opts.dialogPolicy ?? "manual",
 		});
 		try {
 			await this.attachInitialTabs(session, timeoutMs, opts.signal);
 		} catch (err) {
 			session.disposed = true;
 			session.unsubscribe();
+			this.releaseAllWaiters(session);
 			await this.detachAttachedSession(session);
 			throw new Error(`Connected to ${endpoint.browserName} but failed to attach page targets: ${errorMessage(err)}`);
+		}
+		if (this.disposeEpoch !== epoch) {
+			session.disposed = true;
+			session.unsubscribe();
+			this.releaseAllWaiters(session);
+			await this.detachAttachedSession(session);
+			throw shutdownDuringStartupError(`connecting to ${endpoint.browserName}`);
 		}
 		this.sessions.set(id, session);
 		this.activeSessionId = id;
@@ -562,6 +601,8 @@ export class BrowserSessionManager {
 
 	/** Idempotently disconnect / shut down every session (used on Pi `session_shutdown`). */
 	async disposeAll(): Promise<void> {
+		// Invalidate in-flight launch()/attach() calls first: they shut down their new handle instead of registering it.
+		this.disposeEpoch += 1;
 		const all = [...this.sessions.values()];
 		if (all.length === 0) {
 			return;
@@ -650,7 +691,12 @@ export class BrowserSessionManager {
 			const launched = await this.launch({ cwd: opts.cwd, signal: opts.signal });
 			return this.navigate(url, { ...opts, sessionId: launched.session.id, tabId: undefined, newTab: false });
 		}
-		if (opts.newTab) {
+		const targetSessionId = opts.sessionId ?? this.activeSessionId;
+		const targetSession = targetSessionId ? this.sessions.get(targetSessionId) : undefined;
+		// Never hijack the user's current tab in an attached browser unless a tab was explicitly requested.
+		const newTab =
+			opts.newTab ?? (targetSession?.mode === "attached" && opts.tabId === undefined ? true : undefined);
+		if (newTab) {
 			const created = await this.newTab(url, {
 				sessionId: opts.sessionId,
 				cwd: opts.cwd,
@@ -929,6 +975,7 @@ export class BrowserSessionManager {
 			client: handle.client,
 			handle,
 			viewport: opts.viewport,
+			dialogPolicy: "dismiss",
 		});
 		try {
 			await this.attachInitialTabs(session, timeoutMs, opts.signal);
@@ -1022,14 +1069,14 @@ export class BrowserSessionManager {
 		client: CdpClientInterface;
 		handle?: LaunchedBrowserHandle;
 		viewport?: { width: number; height: number; deviceScaleFactor?: number };
+		dialogPolicy: DialogPolicy;
 	}): SessionState {
 		const session: SessionState = {
 			...init,
 			tabs: new Map(),
 			tabsByCdpSession: new Map(),
-			pendingAttachTargets: new Set(),
+			pendingAttaches: new Map(),
 			activeTabId: null,
-			dialogPolicy: "dismiss",
 			nextTabNumber: 1,
 			unsubscribe: () => undefined,
 			disposed: false,
@@ -1071,24 +1118,35 @@ export class BrowserSessionManager {
 		return this.attachTab(session, { targetId, type: "page", title: "", url: "about:blank" }, timeoutMs, signal);
 	}
 
-	private async attachTab(session: SessionState, info: TargetInfoLike, timeoutMs: number, signal?: AbortSignal): Promise<TabState> {
+	private attachTab(session: SessionState, info: TargetInfoLike, timeoutMs: number, signal?: AbortSignal): Promise<TabState> {
 		for (const existing of session.tabs.values()) {
 			if (existing.targetId === info.targetId) {
-				return existing;
+				return Promise.resolve(existing);
 			}
 		}
-		session.pendingAttachTargets.add(info.targetId);
+		const inFlight = session.pendingAttaches.get(info.targetId);
+		if (inFlight) {
+			return inFlight;
+		}
+		const attaching = this.attachTabOnce(session, info, timeoutMs, signal).finally(() => {
+			session.pendingAttaches.delete(info.targetId);
+		});
+		session.pendingAttaches.set(info.targetId, attaching);
+		return attaching;
+	}
+
+	private async attachTabOnce(session: SessionState, info: TargetInfoLike, timeoutMs: number, signal?: AbortSignal): Promise<TabState> {
+		const { sessionId } = await session.client.send<{ sessionId: string }>(
+			"Target.attachToTarget",
+			{ targetId: info.targetId, flatten: true },
+			{ timeoutMs, signal },
+		);
+		const tab = this.createTabState(session, info, sessionId);
+		// Register before enabling domains so replayed events (pending dialogs, console) are routed.
+		session.tabs.set(tab.tabId, tab);
+		session.tabsByCdpSession.set(sessionId, tab);
+		const opts = { sessionId, timeoutMs, signal };
 		try {
-			const { sessionId } = await session.client.send<{ sessionId: string }>(
-				"Target.attachToTarget",
-				{ targetId: info.targetId, flatten: true },
-				{ timeoutMs, signal },
-			);
-			const tab = this.createTabState(session, info, sessionId);
-			// Register before enabling domains so replayed events (pending dialogs, console) are routed.
-			session.tabs.set(tab.tabId, tab);
-			session.tabsByCdpSession.set(sessionId, tab);
-			const opts = { sessionId, timeoutMs, signal };
 			await Promise.all([
 				session.client.send("Page.enable", {}, opts),
 				session.client.send("Runtime.enable", {}, opts),
@@ -1118,10 +1176,38 @@ export class BrowserSessionManager {
 					)
 					.catch(() => undefined);
 			}
-			this.emitChange();
-			return tab;
-		} finally {
-			session.pendingAttachTargets.delete(info.targetId);
+		} catch (err) {
+			// Roll back the half-initialized tab so no zombie lingers in the session maps or the browser.
+			this.discardTab(session, tab);
+			if (session.client.isOpen) {
+				await session.client
+					.send("Target.detachFromTarget", { sessionId }, { timeoutMs: 3_000 })
+					.catch(() => undefined);
+			}
+			throw err;
+		}
+		if (tab.closed) {
+			throw new Error(`Tab ${tab.tabId} closed while it was being attached.`);
+		}
+		this.emitChange();
+		return tab;
+	}
+
+	/** Remove a tab that never finished attaching (no change notification: it was never announced). */
+	private discardTab(session: SessionState, tab: TabState): void {
+		tab.closed = true;
+		for (const waiter of tab.waiters) {
+			waiter.resolve(null);
+		}
+		tab.waiters.clear();
+		if (session.tabs.get(tab.tabId) === tab) {
+			session.tabs.delete(tab.tabId);
+		}
+		if (session.tabsByCdpSession.get(tab.cdpSessionId) === tab) {
+			session.tabsByCdpSession.delete(tab.cdpSessionId);
+		}
+		if (session.activeTabId === tab.tabId) {
+			session.activeTabId = [...session.tabs.keys()].at(-1) ?? null;
 		}
 	}
 
@@ -1572,7 +1658,7 @@ export class BrowserSessionManager {
 			}
 			case "Target.targetCreated": {
 				const info = toTargetInfo(event.params.targetInfo);
-				if (info?.type !== "page" || !info.openerId || session.pendingAttachTargets.has(info.targetId)) {
+				if (info?.type !== "page" || !info.openerId || session.pendingAttaches.has(info.targetId)) {
 					return;
 				}
 				const openerIsOurs = [...session.tabs.values()].some((tab) => tab.targetId === info.openerId);
@@ -1668,17 +1754,24 @@ export class BrowserSessionManager {
 			}
 			case "Page.javascriptDialogOpening": {
 				const type = asString(params.type) ?? "alert";
-				// beforeunload is always accepted so navigations are never silently cancelled.
-				const accept = type === "beforeunload" || session.dialogPolicy === "accept";
 				const defaultPrompt = asString(params.defaultPrompt);
-				tab.dialogs.push({
+				const entry: DialogEntry = {
 					seq: ++tab.seq,
 					timestamp: Date.now(),
 					type,
 					message: asString(params.message) ?? "",
 					defaultPrompt,
-					handled: accept ? "accepted" : "dismissed",
-				});
+					handled: "pending",
+				};
+				if (session.dialogPolicy === "manual") {
+					// Attached user tabs: record only. Never answer — not even beforeunload — so the user decides.
+					tab.dialogs.push(entry);
+					return;
+				}
+				// beforeunload is always accepted so navigations are never silently cancelled.
+				const accept = type === "beforeunload" || session.dialogPolicy === "accept";
+				entry.handled = accept ? "accepted" : "dismissed";
+				tab.dialogs.push(entry);
 				const dialogParams: Record<string, unknown> = { accept };
 				if (accept && type === "prompt") {
 					dialogParams.promptText = defaultPrompt ?? "";

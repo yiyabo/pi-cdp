@@ -513,7 +513,8 @@ async function resolveRootBackendId(
 
 async function releaseObject(client: CdpClientInterface, send: CdpSendOptions, objectId: string): Promise<void> {
 	try {
-		await client.send("Runtime.releaseObject", { objectId }, send);
+		// Deliberately drop the caller's AbortSignal: an aborted snapshot must still free its remote object.
+		await client.send("Runtime.releaseObject", { objectId }, { sessionId: send.sessionId, timeoutMs: 2_000 });
 	} catch {
 		// Object may already be gone after navigation.
 	}

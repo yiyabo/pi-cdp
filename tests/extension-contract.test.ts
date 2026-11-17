@@ -453,6 +453,201 @@ describe("browser action dispatch over a fake CDP endpoint", () => {
 		assert.equal(live.closed, true);
 	});
 
+	it("attached sessions default to manual dialogs (never answered, not even beforeunload) and open in a new tab", async () => {
+		const live = new FakeCdpBrowser("ws://127.0.0.1:9222/devtools/browser/user", [
+			{ targetId: "U1", url: "https://mail.example.com/", title: "Inbox" },
+		]);
+		const endpoint: LiveCdpEndpoint = {
+			id: "chrome-9222",
+			browserName: "Google Chrome",
+			host: "127.0.0.1",
+			port: 9222,
+			wsUrl: live.wsUrl,
+			mode: "normal",
+			source: "DevToolsActivePort",
+		};
+		const manager = new BrowserSessionManager({
+			selectLiveEndpointForAttach: async () => endpoint,
+			connectClient: async () => live,
+			captureAriaSnapshot: async (_client, sessionId, generation) =>
+				makeSnapshot(live.pageUrl(sessionId), "Page", generation, [makeRef("e1", "button", "Compose")]),
+			diffAriaSnapshots: fakeDiff,
+		});
+		const env = { manager, cwd: PKG_ROOT };
+		const summary = await manager.attach({ port: 9222 });
+		assert.equal(summary.dialogPolicy, "manual");
+		assert.equal(summary.activeTabId, "t1");
+
+		live.emit("Page.javascriptDialogOpening", { type: "alert", message: "Unsaved draft" }, "S1");
+		live.emit("Page.javascriptDialogOpening", { type: "beforeunload", message: "" }, "S1");
+		assert.equal(live.methods().includes("Page.handleJavaScriptDialog"), false, "manual policy must never answer dialogs");
+		const report = await manager.getConsole({ tabId: "t1" });
+		assert.deepEqual(
+			report.dialogs.map((entry) => `${entry.type}:${entry.handled}`),
+			["alert:pending", "beforeunload:pending"],
+		);
+		assert.match(textOf(await runBrowserAction({ action: "console", tab_id: "t1" }, env)), /alert "Unsaved draft" → pending/);
+
+		const opened = await runBrowserAction({ action: "open", url: "https://example.com/" }, env);
+		assert.notEqual(opened.isError, true, textOf(opened));
+		assert.equal(opened.details?.tabId, "t2", "open in an attached session must not hijack the user's tab");
+		assert.equal(live.methods().filter((method) => method === "Target.createTarget").length, 1);
+		const navigated = live.sent.filter((entry) => entry.method === "Page.navigate");
+		assert.deepEqual(
+			navigated.map((entry) => entry.sessionId),
+			["S2"],
+		);
+		assert.equal(live.pageUrl("S1"), "https://mail.example.com/");
+
+		// Explicit tab_id still reuses that tab.
+		await runBrowserAction({ action: "open", url: "https://example.org/", tab_id: "t1" }, env);
+		assert.equal(live.methods().filter((method) => method === "Target.createTarget").length, 1);
+		assert.equal(live.pageUrl("S1"), "https://example.org/");
+
+		const policy = await runBrowserAction({ action: "dialog_policy", policy: "dismiss" }, env);
+		assert.match(textOf(policy), /auto-dismissed/);
+		live.emit("Page.javascriptDialogOpening", { type: "confirm", message: "Sure?" }, "S1");
+		assert.deepEqual(live.sent.find((entry) => entry.method === "Page.handleJavaScriptDialog")?.params, { accept: false });
+		const manual = await runBrowserAction({ action: "dialog_policy", policy: "manual" }, env);
+		assert.match(textOf(manual), /only be recorded and left open for the user/);
+
+		await manager.disposeAll();
+		assert.equal(live.methods().includes("Browser.close"), false);
+	});
+
+	it("launched sessions keep the dismiss default and an explicit dialogPolicy wins", async () => {
+		const { manager, browser } = createFakeManager();
+		const launched = await manager.launch();
+		assert.equal(launched.session.dialogPolicy, "dismiss");
+		browser.emit("Page.javascriptDialogOpening", { type: "beforeunload", message: "" }, "S1");
+		assert.deepEqual(browser.sent.find((entry) => entry.method === "Page.handleJavaScriptDialog")?.params, { accept: true });
+		await manager.disposeAll();
+
+		const second = createFakeManager();
+		const manualLaunch = await second.manager.launch({ dialogPolicy: "manual" });
+		assert.equal(manualLaunch.session.dialogPolicy, "manual");
+		second.browser.emit("Page.javascriptDialogOpening", { type: "alert", message: "x" }, "S1");
+		assert.equal(second.browser.methods().includes("Page.handleJavaScriptDialog"), false);
+		await second.manager.disposeAll();
+	});
+
+	it("a failed follow-up snapshot keeps a successful interaction successful and hides secret fill values", async () => {
+		const { manager } = createFakeManager();
+		const env = { manager, cwd: PKG_ROOT };
+		await runBrowserAction({ action: "open", url: "https://example.com/" }, env);
+		const click = await runBrowserAction({ action: "click", target: "@e2" }, env).catch((err: unknown) => err);
+		// The fake browser has no DOM: the click action itself fails and must surface as an error.
+		assert.ok(click instanceof Error);
+
+		manager.click = async (target) => ({ clicked: target, x: 1, y: 2, sessionId: "b1", tabId: "t1" });
+		manager.fill = async (target, value) => ({ filled: `${target} textbox "Password"`, value, sessionId: "b1", tabId: "t1" });
+		manager.settleAndSnapshot = async () => {
+			throw new Error("Tab t1 in session [b1] was closed or crashed.");
+		};
+		const clicked = await runBrowserAction({ action: "click", target: "@e2" }, env);
+		assert.notEqual(clicked.isError, true);
+		assert.equal(clicked.details?.ok, true);
+		const clickText = textOf(clicked);
+		assert.match(clickText, /^Clicked @e2 at \(1, 2\)\./);
+		assert.match(clickText, /Warning: the click succeeded, but the follow-up snapshot failed \(Tab t1 in session \[b1\] was closed or crashed\.\)/);
+		assert.match(clickText, /Do not repeat the click/);
+
+		const filled = await runBrowserAction({ action: "fill", target: "@e3", value: "hunter2-secret" }, env);
+		assert.notEqual(filled.isError, true);
+		assert.doesNotMatch(textOf(filled), /hunter2/);
+		assert.match(textOf(filled), /with 14 characters \(value hidden\)/);
+		const bySelector = await runBrowserAction({ action: "fill", target: "#api-token", value: "tok_123", snapshot: false }, env);
+		assert.doesNotMatch(textOf(bySelector), /tok_123/);
+
+		manager.fill = async (target, value) => ({ filled: `${target} textbox "Email"`, value, sessionId: "b1", tabId: "t1" });
+		const email = await runBrowserAction({ action: "fill", target: "@e4", value: "me@example.com", snapshot: false }, env);
+		assert.match(textOf(email), /with "me@example\.com"/);
+		await manager.disposeAll();
+	});
+
+	it("rolls back half-attached tabs and dedupes concurrent attaches to one target", async () => {
+		const { manager, browser } = createFakeManager();
+		await manager.launch();
+		const failingSend = browser.send.bind(browser);
+		let failNetworkEnable = true;
+		browser.send = async <T,>(method: string, params?: Record<string, unknown>, options?: CdpSendOptions): Promise<T> => {
+			if (method === "Network.enable" && failNetworkEnable) {
+				failNetworkEnable = false;
+				await failingSend(method, params, options);
+				throw new Error("Network.enable failed");
+			}
+			return failingSend<T>(method, params, options);
+		};
+		await assert.rejects(manager.newTab(), /Network\.enable failed/);
+		assert.deepEqual(
+			manager.listTabs().tabs.map((tab) => tab.tabId),
+			["t1"],
+			"the half-initialized tab must not linger",
+		);
+		const detach = browser.sent.filter((entry) => entry.method === "Target.detachFromTarget");
+		assert.deepEqual(detach.map((entry) => entry.params), [{ sessionId: "S2" }]);
+
+		// Popups announced twice while the first attach is in flight share one tab.
+		browser.emit("Target.targetCreated", { targetInfo: { targetId: "POP", type: "page", url: "about:blank", title: "", openerId: "T1" } });
+		browser.emit("Target.targetCreated", { targetInfo: { targetId: "POP", type: "page", url: "about:blank", title: "", openerId: "T1" } });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const popupAttaches = browser.sent.filter((entry) => entry.method === "Target.attachToTarget" && entry.params.targetId === "POP");
+		assert.equal(popupAttaches.length, 1);
+		assert.equal(manager.listTabs().tabs.filter((tab) => tab.targetId === "POP").length, 1);
+		await manager.disposeAll();
+	});
+
+	it("disposeAll during an in-flight launch or attach closes the new browser instead of leaking it", async () => {
+		const { manager, browser, shutdownCount } = createFakeManager();
+		let releaseLaunch: () => void = () => undefined;
+		const gate = new Promise<void>((resolve) => {
+			releaseLaunch = resolve;
+		});
+		const original = (manager as unknown as { deps: { launchBrowserProcess: () => Promise<LaunchedBrowserHandle> } }).deps;
+		const launchHandle = original.launchBrowserProcess;
+		original.launchBrowserProcess = async () => {
+			await gate;
+			return launchHandle();
+		};
+		const pending = manager.launch();
+		await manager.disposeAll();
+		releaseLaunch();
+		await assert.rejects(pending, /shut down while launching Fake Chrome/);
+		assert.equal(shutdownCount(), 1);
+		assert.equal(browser.closed, true);
+		assert.equal(manager.hasSessions(), false);
+
+		const live = new FakeCdpBrowser("ws://127.0.0.1:9222/devtools/browser/user", [
+			{ targetId: "U1", url: "https://mail.example.com/", title: "Inbox" },
+		]);
+		let releaseConnect: () => void = () => undefined;
+		const connectGate = new Promise<void>((resolve) => {
+			releaseConnect = resolve;
+		});
+		const attacher = new BrowserSessionManager({
+			selectLiveEndpointForAttach: async () => ({
+				id: "chrome-9222",
+				browserName: "Google Chrome",
+				host: "127.0.0.1",
+				port: 9222,
+				wsUrl: live.wsUrl,
+				mode: "normal",
+				source: "test",
+			}),
+			connectClient: async () => {
+				await connectGate;
+				return live;
+			},
+		});
+		const attaching = attacher.attach();
+		await attacher.disposeAll();
+		releaseConnect();
+		await assert.rejects(attaching, /shut down while connecting to Google Chrome/);
+		assert.equal(live.closed, true);
+		assert.equal(live.methods().includes("Target.attachToTarget"), false);
+		assert.equal(attacher.hasSessions(), false);
+	});
+
 	it("normalizes bare hosts, localhost ports and file paths for navigation", () => {
 		assert.match(normalizeNavigationUrl("example.com"), /^https:\/\/example\.com\/?$/);
 		assert.match(normalizeNavigationUrl("localhost:3000/app"), /^http:\/\/localhost:3000\/app$/);

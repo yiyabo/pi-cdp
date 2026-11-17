@@ -50,7 +50,7 @@ Rules:
 
 - `{"action": "wait", "selector": ".toast"}` · `"text": "Saved"` · `"url_includes": "/dashboard"` · `"network_idle_ms": 500` · `"delay_ms": 1000`.
 - `{"action": "evaluate", "expression": "document.querySelectorAll('li').length"}` — promises are awaited; exceptions come back as errors.
-- `{"action": "console"}` — page errors, console messages, and auto-handled dialogs.
+- `{"action": "console"}` — page errors, console messages, and JavaScript dialogs (`accepted`, `dismissed`, or `pending` when left for the user).
 - `{"action": "network", "failed_only": true}` — failed and HTTP ≥ 400 requests with method, URL, and error text.
 - Check `console` and `network` before guessing why a page is blank or broken.
 
@@ -65,7 +65,9 @@ Rules:
 - `launch` starts another session (`b2`): `headless: false` for a visible window, `user_data_dir` for a persistent profile, `executable_path` for a specific browser.
 - `sessions` lists everything; `switch_session` changes the default; most actions accept `session_id` / `tab_id`.
 - `back`, `forward`, `reload` re-snapshot the page.
-- JavaScript `alert` / `confirm` / `prompt` are answered automatically (default dismiss) so they never hang a call; change with `{"action": "dialog_policy", "policy": "accept"}`.
+- In launched sessions JavaScript `alert` / `confirm` / `prompt` are answered automatically (default dismiss) so they never hang a call; change with `{"action": "dialog_policy", "policy": "accept"}`.
+- Attached sessions default to `"policy": "manual"`: dialogs (including `beforeunload`) are only recorded, never answered, so the user's tabs are never altered. A page blocked by an open dialog stops responding until the user answers it; ask the user, or switch with `{"action": "dialog_policy", "policy": "dismiss"}` only when they agree.
+- If an interaction succeeds but its follow-up snapshot fails, the result is still a success with a warning — do not repeat the click/fill/press; take a fresh `snapshot` instead.
 
 ## Attaching to the user's Chrome
 
@@ -74,6 +76,7 @@ Use only when the user asks to work in their real browser (existing logins, exte
 1. The user enables remote debugging: recent Chrome via the toggle at `chrome://inspect/#remote-debugging`, or by starting Chrome with `--remote-debugging-port=9222` and a dedicated `--user-data-dir`.
 2. `{"action": "doctor"}` (or `/cdp doctor`) shows detected browsers and live endpoints.
 3. `{"action": "attach"}` auto-selects the live endpoint; or pass `port`, `host`, or `ws_url`. Chrome may show an approval prompt the user must accept.
+   - In an attached session `open` loads the URL in a **new tab** by default so the user's current tab is never hijacked; pass `tab_id` (or `new_tab: false`) only when the user wants a specific existing tab reused.
 4. `{"action": "disconnect"}` detaches only; the user's browser and tabs stay open. Never close tabs you did not open in an attached session without asking.
 
 ## Cleanup

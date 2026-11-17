@@ -136,7 +136,12 @@ const BrowserParamsSchema = Type.Object({
 	height: Type.Optional(Type.Integer({ minimum: 200, maximum: 4320 })),
 	device_scale_factor: Type.Optional(Type.Number({ minimum: 0.5, maximum: 4 })),
 	mobile: Type.Optional(Type.Boolean()),
-	policy: Type.Optional(stringEnum(["accept", "dismiss"] as const, { description: "dialog_policy: how to answer JS dialogs." })),
+	policy: Type.Optional(
+		stringEnum(["accept", "dismiss", "manual"] as const, {
+			description:
+				"dialog_policy: how to answer JS dialogs (manual = record only, never answer; default for attached sessions).",
+		}),
+	),
 	failed_only: Type.Optional(Type.Boolean({ description: "network: only failed (or HTTP >= 400) requests." })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "console/network: max entries." })),
 	clear: Type.Optional(Type.Boolean({ description: "console/network: clear the buffer after reading." })),
@@ -182,6 +187,13 @@ function imageBlock(shot: ScreenshotResult): ImageContent {
 
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
+}
+
+const SECRET_TARGET_RE = /pass(?:word|wd|code|phrase)?\b|token|secret|api[-_ ]?key|\botp\b/i;
+
+/** True when a fill target (selector or ref description) looks like a credential field whose value must not be echoed. */
+export function looksSecret(text: string): boolean {
+	return SECRET_TARGET_RE.test(text);
 }
 
 function requireParam<T>(value: T | undefined, name: string, action: string): T {
@@ -346,7 +358,11 @@ async function runSessionAction(
 		case "dialog_policy": {
 			const policy = requireParam(params.policy, "policy", action);
 			const summary = manager.setDialogPolicy(policy, params.session_id);
-			return okResult(`[${summary.id}] JavaScript dialogs will now be auto-${policy === "accept" ? "accepted" : "dismissed"}.`, {
+			const behavior =
+				policy === "manual"
+					? "only be recorded and left open for the user to answer"
+					: `be auto-${policy === "accept" ? "accepted" : "dismissed"}`;
+			return okResult(`[${summary.id}] JavaScript dialogs will now ${behavior}.`, {
 				ok: true,
 				action,
 				sessionId: summary.id,
@@ -450,13 +466,21 @@ async function withSettledSnapshot(
 	if (params.snapshot === false) {
 		return okResult(headline, details);
 	}
-	const outcome = await env.manager.settleAndSnapshot({
-		sessionId: ids.sessionId,
-		tabId: ids.tabId,
-		timeoutMs: params.timeout_ms,
-		signal: env.signal,
-		snapshot: snapshotOptionsFrom(params, env.signal),
-	});
+	let outcome: SnapshotOutcome;
+	try {
+		outcome = await env.manager.settleAndSnapshot({
+			sessionId: ids.sessionId,
+			tabId: ids.tabId,
+			timeoutMs: params.timeout_ms,
+			signal: env.signal,
+			snapshot: snapshotOptionsFrom(params, env.signal),
+		});
+	} catch (err) {
+		// The action already happened: a failed follow-up snapshot must not read as a failed action
+		// (otherwise the model retries and e.g. submits a form twice).
+		const warning = `Warning: the ${action} succeeded, but the follow-up snapshot failed (${errorMessage(err)}). Do not repeat the ${action}; run snapshot to see the current page.`;
+		return okResult(`${headline}\n\n${warning}`, details);
+	}
 	return okResult(`${headline}\n\n${renderSnapshotOutcome(outcome, true)}`, {
 		...details,
 		tabId: outcome.tabId,
@@ -482,7 +506,10 @@ async function runInteractionAction(
 		case "fill": {
 			const target = requireParam(params.target, "target", action);
 			const res = await manager.fill(target, requireParam(params.value, "value", action), common);
-			return withSettledSnapshot(`Filled ${res.filled} with ${JSON.stringify(res.value)}.`, res, action, params, env);
+			const headline = looksSecret(`${target} ${res.filled}`)
+				? `Filled ${res.filled} with ${res.value.length} characters (value hidden).`
+				: `Filled ${res.filled} with ${JSON.stringify(res.value)}.`;
+			return withSettledSnapshot(headline, res, action, params, env);
 		}
 		case "select": {
 			const target = requireParam(params.target, "target", action);
