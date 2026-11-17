@@ -158,7 +158,7 @@ export function collectDescendantPids(rootPid: number): number[] {
 			}
 		}
 	}
-	return topDown.reverse();
+	return topDown.toReversed();
 }
 
 /**

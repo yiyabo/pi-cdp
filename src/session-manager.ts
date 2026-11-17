@@ -863,7 +863,7 @@ export class BrowserSessionManager {
 	// ───────────────────────────── diagnostics buffers ─────────────────────────────
 
 	async getConsole(opts: TabRef & { limit?: number; clear?: boolean } = {}): Promise<ConsoleReport> {
-		const { session, tab } = await this.resolveTab(opts, undefined, false);
+		const { session, tab } = this.requireExistingTab(opts);
 		const limit = opts.limit ?? MAX_BUFFER_ENTRIES;
 		const report: ConsoleReport = {
 			sessionId: session.id,
@@ -881,7 +881,7 @@ export class BrowserSessionManager {
 	}
 
 	async getNetwork(opts: TabRef & { failedOnly?: boolean; limit?: number; clear?: boolean } = {}): Promise<NetworkReport> {
-		const { session, tab } = await this.resolveTab(opts, undefined, false);
+		const { session, tab } = this.requireExistingTab(opts);
 		const all = tab.network.toArray();
 		const filtered = opts.failedOnly ? all.filter(isFailedRequest) : all;
 		const limit = opts.limit ?? 50;
@@ -1235,11 +1235,7 @@ export class BrowserSessionManager {
 		return session;
 	}
 
-	private async resolveTab(
-		ref: TabRef,
-		signal?: AbortSignal,
-		createIfMissing = true,
-	): Promise<{ session: SessionState; tab: TabState }> {
+	private requireExistingTab(ref: TabRef): { session: SessionState; tab: TabState } {
 		const session = this.requireSession(ref.sessionId);
 		if (ref.tabId) {
 			const tab = session.tabs.get(ref.tabId);
@@ -1254,8 +1250,26 @@ export class BrowserSessionManager {
 		if (active) {
 			return { session, tab: active };
 		}
-		if (!createIfMissing) {
-			throw new Error(`Session [${session.id}] has no open tabs. Use browser action 'new_tab' first.`);
+		throw new Error(`Session [${session.id}] has no open tabs. Use browser action 'new_tab' first.`);
+	}
+
+	private async resolveTab(
+		ref: TabRef,
+		signal?: AbortSignal,
+	): Promise<{ session: SessionState; tab: TabState }> {
+		const session = this.requireSession(ref.sessionId);
+		if (ref.tabId) {
+			const tab = session.tabs.get(ref.tabId);
+			if (!tab) {
+				throw new Error(
+					`Unknown tab '${ref.tabId}' in session [${session.id}]. Tabs: ${[...session.tabs.keys()].join(", ") || "(none)"}.`,
+				);
+			}
+			return { session, tab };
+		}
+		const active = session.activeTabId ? session.tabs.get(session.activeTabId) : undefined;
+		if (active) {
+			return { session, tab: active };
 		}
 		const created = await this.createTab(session, DEFAULT_COMMAND_TIMEOUT_MS, signal);
 		session.activeTabId = created.tabId;

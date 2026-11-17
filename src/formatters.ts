@@ -148,7 +148,12 @@ export function formatSessions(sessions: BrowserSessionSummary[], activeSessionI
 	const lines: string[] = [`Browser sessions (${sessions.length}):`];
 	for (const session of sessions) {
 		const marker = session.id === activeSessionId ? "*" : " ";
-		const kind = session.mode === "attached" ? "attached" : session.headless ? "headless" : "headed";
+		let kind = "headed";
+		if (session.mode === "attached") {
+			kind = "attached";
+		} else if (session.headless) {
+			kind = "headless";
+		}
 		const pid = session.pid === undefined ? "" : ` pid ${session.pid}`;
 		lines.push(
 			`${marker} [${session.id}] ${session.name} — ${session.browserName} (${kind}${pid}), ${plural(session.tabs.length, "tab")}, active ${session.activeTabId ?? "none"}, dialogs ${session.dialogPolicy}`,
