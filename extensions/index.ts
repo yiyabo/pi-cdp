@@ -265,13 +265,21 @@ function renderCollapsedLines(text: string, maxLines: number, theme: Theme, widt
 	return visible.join("\n");
 }
 
-function firstText(result: AgentToolResult<unknown>): string {
+function firstText(result: AgentToolResult<unknown> | undefined): string {
+	if (!result || !Array.isArray(result.content)) {
+		return "";
+	}
 	const block = result.content[0];
-	return block && block.type === "text" ? block.text : "";
+	return block && typeof block === "object" && block.type === "text" && typeof block.text === "string"
+		? block.text
+		: "";
 }
 
-function hasImage(result: AgentToolResult<unknown>): boolean {
-	return result.content.some((block) => block.type === "image");
+function hasImage(result: AgentToolResult<unknown> | undefined): boolean {
+	if (!result || !Array.isArray(result.content)) {
+		return false;
+	}
+	return result.content.some((block) => Boolean(block && typeof block === "object" && block.type === "image"));
 }
 
 interface ActionEnv {
@@ -358,10 +366,12 @@ async function runSessionAction(
 		case "dialog_policy": {
 			const policy = requireParam(params.policy, "policy", action);
 			const summary = manager.setDialogPolicy(policy, params.session_id);
-			const behavior =
-				policy === "manual"
-					? "only be recorded and left open for the user to answer"
-					: `be auto-${policy === "accept" ? "accepted" : "dismissed"}`;
+			const behaviorByPolicy: Record<typeof policy, string> = {
+				manual: "only be recorded and left open for the user to answer",
+				accept: "be auto-accepted",
+				dismiss: "be auto-dismissed",
+			};
+			const behavior = behaviorByPolicy[policy];
 			return okResult(`[${summary.id}] JavaScript dialogs will now ${behavior}.`, {
 				ok: true,
 				action,
@@ -678,8 +688,9 @@ export default function piCdpExtension(pi: ExtensionAPI): void {
 		parameters: WebInspectParamsSchema,
 		executionMode: "sequential",
 		annotations: {
-			readOnlyHint: true,
+			readOnlyHint: false,
 			destructiveHint: false,
+			openWorldHint: true,
 		},
 		async execute(_toolCallId, params: WebInspectParams, signal, _onUpdate, ctx) {
 			lastCtx = ctx;
@@ -755,7 +766,8 @@ export default function piCdpExtension(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 		annotations: {
 			readOnlyHint: false,
-			destructiveHint: false,
+			destructiveHint: true,
+			openWorldHint: true,
 		},
 		async execute(_toolCallId, params: BrowserParams, signal, _onUpdate, ctx) {
 			lastCtx = ctx;
@@ -781,7 +793,8 @@ export default function piCdpExtension(pi: ExtensionAPI): void {
 				parts.push(theme.fg("text", subject));
 			}
 			if (args.value !== undefined) {
-				parts.push(theme.fg("muted", JSON.stringify(args.value)));
+				const renderedValue = looksSecret(args.target ?? "") ? `"[${args.value.length} chars hidden]"` : JSON.stringify(args.value);
+				parts.push(theme.fg("muted", renderedValue));
 			}
 			return new Text(parts.join(" "), 0, 0);
 		},
