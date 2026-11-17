@@ -1,0 +1,87 @@
+{
+  "name": "pi-cdp",
+  "version": "0.1.0",
+  "description": "Zero-dependency native Chrome DevTools Protocol (CDP) browser automation, @eN accessibility snapshots, visual screenshots, and live Chrome attach for Pi.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-skill",
+    "pi-browser",
+    "cdp",
+    "browser",
+    "chrome",
+    "chromium",
+    "playwright",
+    "automation",
+    "accessibility",
+    "screenshot"
+  ],
+  "license": "MIT",
+  "author": "yiyabo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yiyabo/pi-cdp.git"
+  },
+  "homepage": "https://github.com/yiyabo/pi-cdp#readme",
+  "bugs": {
+    "url": "https://github.com/yiyabo/pi-cdp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^1.5.0",
+    "@earendil-works/pi-ai": "^1.5.0",
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@earendil-works/pi-tui": "^1.5.0",
+    "@types/node": "^22.10.0",
+    "typebox": "^1.1.0",
+    "typescript": "^5.8.0"
+  }
+}
